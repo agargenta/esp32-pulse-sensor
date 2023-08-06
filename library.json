@@ -1,0 +1,24 @@
+{
+  "name": "esp32-pulse-sensor",
+  "keywords": "pulse, sensor, hall, flow, cycle",
+  "description": "An ESP32-compatible C component for interfacing with pulse sensors (e.g. flow) via GPIO.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agargenta/esp32-pulse-sensor.git"
+  },
+  "authors": [
+    {
+      "name": "Aleksandar Gargenta",
+      "url": "https://github.com/agargenta",
+      "maintainer": true
+    }
+  ],
+  "version": "0.1",
+  "frameworks": "espidf",
+  "platforms": "espressif32",
+  "build": {
+    "flags": [
+      "-I include/"
+    ]
+  }
+}
