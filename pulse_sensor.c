@@ -73,7 +73,7 @@ typedef enum
     PULSE_SENSOR_TICK = 2
 } pulse_sensor_message_type_t;
 
-typedef struct pulse_sensor_message
+typedef struct
 {
     pulse_sensor_message_type_t type;
     int64_t timestamp;
@@ -118,7 +118,9 @@ static void pulse_sensor_notify(const pulse_sensor_h ps, pulse_sensor_notificati
                                               (void *)&(n),
                                               ps->config.notification_timeout);
         if (r != pdTRUE)
+        {
             ESP_LOGW(TAG, "Notification timeout on GPIO %d queue: %d", ps->config.gpio_num, r);
+        }
     }
 }
 
