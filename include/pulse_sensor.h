@@ -42,7 +42,7 @@
 #define PULSE_SENSOR_MIN_CYCLE_PULSES 1
 #define PULSE_SENSOR_CYCLE_TIMEOUT 1000000 // 1 second (in microseconds)
 
-#define PULSE_SENSOR_QUEUE_SIZE 100
+#define PULSE_SENSOR_QUEUE_SIZE 64
 #define PULSE_SENSOR_NOTIFICATION_TIMEOUT pdMS_TO_TICKS(1) // 1 millisecond (in ticks)
 
 #ifdef __cplusplus
