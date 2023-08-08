@@ -54,66 +54,67 @@
 
 struct pulse_sensor_s
 {
-    pulse_sensor_config_t config;
-    QueueHandle_t queue;
-    TaskHandle_t task;
-    esp_timer_handle_t timer;
-    int64_t last_pulse_timestamp;
-    int64_t last_significant_pulse_timestamp;
-    int64_t current_cycle_timestamp;
-    uint64_t current_cycle_pulses;
-    uint64_t total_pulses;
-    uint64_t total_duration;
-    uint32_t total_cycles;
+    pulse_sensor_config_t config;               /// the config used to open this device
+    QueueHandle_t queue;                        /// internal queue for managing pulses and ticks
+    TaskHandle_t task;                          /// internal task for processing pulses and ticks
+    esp_timer_handle_t timer;                   /// internal timer for generating ticks
+    int64_t latest_pulse_timestamp;             /// the time (usec since boot) of the latest (most recent) pulse (includes jitter)
+    int64_t latest_significant_pulse_timestamp; /// the time (usec since boot) of the latest (most recent) significant pulse (ignores jitter)
+    int64_t current_cycle_timestamp;            /// the time (usec since boot) of the first pulse in the current cycle
+    uint64_t current_cycle_pulses;              /// the number of pulses in the current cycle
+    uint64_t total_pulses;                      /// the total pulses across all cycles (includes jitter)
+    uint64_t total_significant_pulses;          /// the total significant pulses across all cycles (ignores jitter)
+    uint64_t total_duration;                    /// the total duration (usec) across all cycles
+    uint32_t total_cycles;                      /// the total number of cycles
 };
 
 typedef enum
 {
-    PULSE_SENSOR_PULSE = 1,
-    PULSE_SENSOR_TICK = 2
-} pulse_sensor_message_type_t;
+    PULSE_SENSOR_PULSE = 1, /// a pulse coming from the device
+    PULSE_SENSOR_TICK = 2   /// a tick coming from the internal timer
+} pulse_sensor_event_type_t;
 
 typedef struct
 {
-    pulse_sensor_message_type_t type;
-    int64_t timestamp;
-} pulse_sensor_message_t;
+    pulse_sensor_event_type_t type; /// the type of the event
+    int64_t timestamp;              /// time (usec since boot) of when this event occurred
+} pulse_sensor_event_t;
 
 static const char *TAG = "pulse_sensor";
 
 static void IRAM_ATTR gpio_interrupt_handler(void *args)
 {
     const pulse_sensor_h ps = (pulse_sensor_h)args;
-    const pulse_sensor_message_t m = {.type = PULSE_SENSOR_PULSE, .timestamp = esp_timer_get_time()};
+    const pulse_sensor_event_t m = {.type = PULSE_SENSOR_PULSE, .timestamp = esp_timer_get_time()};
     xQueueSendToBackFromISR(ps->queue, (void *)&(m), NULL);
 }
 
 static void timer_handler(void *args)
 {
     const pulse_sensor_h ps = (pulse_sensor_h)args;
-    const pulse_sensor_message_t m = {.type = PULSE_SENSOR_TICK, .timestamp = esp_timer_get_time()};
+    const pulse_sensor_event_t m = {.type = PULSE_SENSOR_TICK, .timestamp = esp_timer_get_time()};
     const BaseType_t r = xQueueSendToBack(ps->queue, (void *)&(m), pdMS_TO_TICKS(10));
     if (r != pdTRUE)
     {
-        ESP_LOGW(TAG, "Timer tick timeout on GPIO %d queue: %d", ps->config.gpio_num, r);
+        ESP_LOGW(TAG, "Timer tick event timeout on GPIO %d queue: %d", ps->config.gpio_num, r);
     }
 }
 
-static void pulse_sensor_notify(const pulse_sensor_h ps, pulse_sensor_notification_type_t type)
+static void pulse_sensor_notify(const pulse_sensor_h ps, const pulse_sensor_notification_type_t type)
 {
     ESP_LOGD(TAG, "Notification: gpio=%d, type=%d, pulses=%llu, duration=%lld (usec)",
              ps->config.gpio_num,
              type,
              ps->current_cycle_pulses,
-             ps->last_pulse_timestamp - ps->current_cycle_timestamp);
+             ps->latest_pulse_timestamp - ps->current_cycle_timestamp);
     if (ps->config.notification_queue)
     {
         const pulse_sensor_notification_t n = {
             .type = type,
             .notification_arg = ps->config.notification_arg,
-            .timestamp = ps->last_pulse_timestamp,
+            .timestamp = ps->latest_pulse_timestamp,
             .pulses = ps->current_cycle_pulses,
-            .duration = ps->last_pulse_timestamp - ps->current_cycle_timestamp};
+            .duration = ps->latest_pulse_timestamp - ps->current_cycle_timestamp};
         const BaseType_t r = xQueueSendToBack(ps->config.notification_queue,
                                               (void *)&(n),
                                               ps->config.notification_timeout);
@@ -127,14 +128,14 @@ static void pulse_sensor_notify(const pulse_sensor_h ps, pulse_sensor_notificati
 static void pulse_sensor_task(void *args)
 {
     const pulse_sensor_h ps = (pulse_sensor_h)args;
-    pulse_sensor_message_t m;
+    pulse_sensor_event_t m;
     ESP_LOGD(TAG, "Monitoring on GPIO %d", ps->config.gpio_num);
     while (true)
     {
         if (!xQueueReceive(ps->queue, &m, portMAX_DELAY))
         {
-            ESP_LOGE(TAG, "Message timeout on GPIO %d queue. Bailing out.", ps->config.gpio_num);
-            break; // This should never happen
+            ESP_LOGW(TAG, "Message timeout on GPIO %d queue. Bailing out.", ps->config.gpio_num);
+            break;
         }
         switch (m.type)
         {
@@ -146,26 +147,29 @@ static void pulse_sensor_task(void *args)
                     esp_timer_start_periodic(ps->timer, ps->config.cycle_timeout));
                 ESP_LOGD(TAG, "Started timer on GPIO %d", ps->config.gpio_num);
             }
-            ps->last_pulse_timestamp = m.timestamp;
-            if (!ps->current_cycle_timestamp)
+            ps->current_cycle_pulses++;
+            ps->total_pulses++;
+
+            ps->latest_pulse_timestamp = m.timestamp;
+            if (ps->current_cycle_timestamp == 0)
             {
                 ps->current_cycle_timestamp = m.timestamp;
             }
-            ps->current_cycle_pulses++;
+
             if (ps->current_cycle_pulses == ps->config.min_cycle_pulses)
             {
-                ps->total_pulses += ps->current_cycle_pulses;
+                ps->total_significant_pulses += ps->current_cycle_pulses;
                 ps->total_duration += m.timestamp - ps->current_cycle_timestamp;
-                ps->last_significant_pulse_timestamp = m.timestamp;
                 ps->total_cycles++;
+                ps->latest_significant_pulse_timestamp = m.timestamp;
                 ESP_LOGI(TAG, "Cycle %lu started on GPIO %d", ps->total_cycles, ps->config.gpio_num);
                 pulse_sensor_notify(ps, PULSE_SENSOR_CYCLE_STARTED);
             }
             else if (ps->current_cycle_pulses > ps->config.min_cycle_pulses)
             {
-                ps->total_pulses++;
-                ps->total_duration += m.timestamp - ps->last_significant_pulse_timestamp;
-                ps->last_significant_pulse_timestamp = m.timestamp;
+                ps->total_significant_pulses++;
+                ps->total_duration += m.timestamp - ps->latest_significant_pulse_timestamp;
+                ps->latest_significant_pulse_timestamp = m.timestamp;
             }
             break;
         case PULSE_SENSOR_TICK:
@@ -211,7 +215,7 @@ esp_err_t pulse_sensor_open(pulse_sensor_config_t config, pulse_sensor_h *pulse_
     SET_DEFAULT(ps->config.queue_size, PULSE_SENSOR_QUEUE_SIZE)
     SET_DEFAULT(ps->config.notification_timeout, PULSE_SENSOR_NOTIFICATION_TIMEOUT)
 
-    ps->queue = xQueueCreate(ps->config.queue_size, sizeof(pulse_sensor_message_t));
+    ps->queue = xQueueCreate(ps->config.queue_size, sizeof(pulse_sensor_event_t));
     ESP_GOTO_ON_FALSE(ps->queue != NULL, ESP_ERR_NO_MEM, pulse_sensor_cleanup, TAG, "create queue");
 
     char name[64];
@@ -301,10 +305,10 @@ bool pulse_sensor_is_in_cycle(const pulse_sensor_h ps)
     return ps->current_cycle_pulses >= ps->config.min_cycle_pulses;
 }
 
-int64_t pulse_sensor_get_last_pulse_timestamp(const pulse_sensor_h ps)
+int64_t pulse_sensor_get_latest_pulse_timestamp(const pulse_sensor_h ps)
 {
-    VALIDATE_PULSE_SENSOR(ps, "get_last_pulse_timestamp", -1)
-    return ps->last_significant_pulse_timestamp;
+    VALIDATE_PULSE_SENSOR(ps, "get_latest_pulse_timestamp", -1)
+    return ps->latest_significant_pulse_timestamp;
 }
 
 int64_t pulse_sensor_get_current_cycle_timestamp(const pulse_sensor_h ps)

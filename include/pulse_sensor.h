@@ -78,7 +78,8 @@ extern "C"
     {
         gpio_num_t gpio_num;              /// GPIO number for this sensor (*required)
         uint32_t min_cycle_pulses;        /// minimum number of pulses for a cycle to be counted (>= 1); pulses below this threshold are discared (defaults to 1)
-        uint64_t cycle_timeout;           /// max time (in microseconds) since the last pulse for a cycle to be considered finished (defaults to 1 second)
+        uint64_t cycle_timeout;           /// max time (in microseconds) since the latest pulse for a cycle to be considered finished (defaults to 1 second)
+        uint64_t check_period;            /// time (in microseconds) between checks for the current rate and cycle status (defaults to 1 second)
         uint32_t queue_size;              /// internal queue size for buffering pulses and time ticks (defaults to 100)
         QueueHandle_t notification_queue; /// notification queue to which to send cycle start/stop events (optional)
         TickType_t notification_timeout;  /// max time (in ticks) to wait to send a notification (defaults to 1 ms)
@@ -117,7 +118,7 @@ extern "C"
      * @param[in] pulse_sensor The pulse sensor to check.
      * @return microseconds since boot of the latest pulse cycle; -1 if pulse_sensor is null.
      */
-    int64_t pulse_sensor_get_last_pulse_timestamp(const pulse_sensor_h pulse_sensor);
+    int64_t pulse_sensor_get_latest_pulse_timestamp(const pulse_sensor_h pulse_sensor);
 
     /**
      * @brief Get the timestamp (microseconds since boot) of when the current cycle started.
