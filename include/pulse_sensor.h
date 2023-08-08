@@ -41,6 +41,7 @@
 
 #define PULSE_SENSOR_MIN_CYCLE_PULSES 1
 #define PULSE_SENSOR_CYCLE_TIMEOUT 1000000 // 1 second (in microseconds)
+#define PULSE_SENSOR_CHECK_PERIOD 1000000  // 1 second (in microseconds)
 
 #define PULSE_SENSOR_QUEUE_SIZE 64
 #define PULSE_SENSOR_NOTIFICATION_TIMEOUT pdMS_TO_TICKS(1) // 1 millisecond (in ticks)
@@ -87,6 +88,15 @@ extern "C"
     } pulse_sensor_config_t;
 
     /**
+     * @brief Rate definition.
+     */
+    typedef struct
+    {
+        uint64_t pulses;   /// the number of pulses during the measurement period
+        uint64_t duration; /// the length (in microseconds) of the measurement period
+    } pulse_sensor_rate_t;
+
+    /**
      * @brief A pointer to an opaque structure representing an opened pulse sensor.
      */
     typedef struct pulse_sensor_s *pulse_sensor_h;
@@ -105,6 +115,15 @@ extern "C"
      * @return ESP_OK if successfully closed; otherwise, an error code.
      */
     esp_err_t pulse_sensor_close(pulse_sensor_h pulse_sensor);
+
+    /**
+     * @brief Get the current pluse rate since the previous check period, which could be up to
+     *        2x check_period in duration).
+     * @param[in] pulse_sensor The pulse sensor to check period.
+     * @return the current pluse rate since the previous check period; an empty structure if the
+     *         pulse_sensor is null.
+     */
+    pulse_sensor_rate_t pulse_sensor_get_current_rate(const pulse_sensor_h pulse_sensor);
 
     /**
      * @brief Check if the pulse sensor is currently in an active cycle.
@@ -144,6 +163,16 @@ extern "C"
     uint64_t pulse_sensor_get_current_cycle_duration(const pulse_sensor_h pulse_sensor);
 
     /**
+     * @brief Get the rate of pulses since the current cycle started. This is a convenience function
+     *        that essentially combines pulse_sensor_get_current_cycle_pulses(const pulse_sensor_h)
+     *        and pulse_sensor_get_current_cycle_duration(const pulse_sensor_h).
+     * @param[in] pulse_sensor The pulse sensor to check.
+     * @return the rate (pulses and duration in microseconds) since the current cycle started;
+     *         an empty structure if not in cycle or if the pulse_sensor is null.
+     */
+    pulse_sensor_rate_t pulse_sensor_get_current_cycle_rate(const pulse_sensor_h pulse_sensor);
+
+    /**
      * @brief Get the total count of pulses since this device was opened.
      * @param[in] pulse_sensor The pulse sensor to check.
      * @return the pulse count since this device was opened (possibly 0); -1 if pulse_sensor is null.
@@ -165,6 +194,16 @@ extern "C"
      *         -1 if pulse_sensor is null.
      */
     uint32_t pulse_sensor_get_total_cycles(const pulse_sensor_h pulse_sensor);
+
+    /**
+     * @brief Get the rate of pulses since since this device was opened. This is a convenience
+     *        function that essentially combines pulse_sensor_get_total_pulses(const pulse_sensor_h)
+     *        and pulse_sensor_get_total_duration(const pulse_sensor_h).
+     * @param[in] pulse_sensor The pulse sensor to check.
+     * @return the rate (pulses and duration in microseconds) since this device was opened;
+     *         an empty structure if no pulses or if the pulse_sensor is null.
+     */
+    pulse_sensor_rate_t pulse_sensor_get_total_rate(const pulse_sensor_h pulse_sensor);
 
 #ifdef __cplusplus
 }

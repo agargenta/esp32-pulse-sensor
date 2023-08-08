@@ -60,6 +60,10 @@ struct pulse_sensor_s
     esp_timer_handle_t timer;                   /// internal timer for generating ticks
     int64_t latest_pulse_timestamp;             /// the time (usec since boot) of the latest (most recent) pulse (includes jitter)
     int64_t latest_significant_pulse_timestamp; /// the time (usec since boot) of the latest (most recent) significant pulse (ignores jitter)
+    int64_t latest_tick_timestamp;              /// the time (usec since boot) of the latest tick
+    int64_t previous_tick_timestamp;            /// the time (usec since boot) of the tick preceding the latest one
+    uint32_t latest_tick_pulses;                /// the number of pulses since latest_tick_timestamp (could include jitter)
+    uint32_t previous_tick_pulses;              /// the number of pulses from previous_tick_pulses until latest_tick_timestamp (could include jitter)
     int64_t current_cycle_timestamp;            /// the time (usec since boot) of the first pulse in the current cycle
     uint64_t current_cycle_pulses;              /// the number of pulses in the current cycle
     uint64_t total_pulses;                      /// the total pulses across all cycles (includes jitter)
@@ -144,9 +148,10 @@ static void pulse_sensor_task(void *args)
             if (ps->current_cycle_pulses == 0)
             {
                 ESP_ERROR_CHECK_WITHOUT_ABORT(
-                    esp_timer_start_periodic(ps->timer, ps->config.cycle_timeout));
+                    esp_timer_start_periodic(ps->timer, ps->config.check_period));
                 ESP_LOGD(TAG, "Started timer on GPIO %d", ps->config.gpio_num);
             }
+            ps->latest_tick_pulses++;
             ps->current_cycle_pulses++;
             ps->total_pulses++;
 
@@ -174,8 +179,14 @@ static void pulse_sensor_task(void *args)
             break;
         case PULSE_SENSOR_TICK:
             ESP_LOGV(TAG, "Tick on %d", ps->config.gpio_num);
+
+            ps->previous_tick_timestamp = ps->latest_tick_timestamp;
+            ps->previous_tick_pulses = ps->latest_tick_pulses;
+            ps->latest_tick_timestamp = m.timestamp;
+            ps->latest_tick_pulses = 0;
+
             if (ps->current_cycle_pulses > 0 &&
-                m.timestamp - ps->last_pulse_timestamp > ps->config.cycle_timeout)
+                (m.timestamp - ps->latest_pulse_timestamp) > ps->config.cycle_timeout)
             {
                 if (ps->current_cycle_pulses >= ps->config.min_cycle_pulses)
                 {
@@ -212,6 +223,7 @@ esp_err_t pulse_sensor_open(pulse_sensor_config_t config, pulse_sensor_h *pulse_
     const gpio_num_t gpio_num = ps->config.gpio_num;
     SET_DEFAULT(ps->config.min_cycle_pulses, PULSE_SENSOR_MIN_CYCLE_PULSES)
     SET_DEFAULT(ps->config.cycle_timeout, PULSE_SENSOR_CYCLE_TIMEOUT)
+    SET_DEFAULT(ps->config.check_period, PULSE_SENSOR_CHECK_PERIOD)
     SET_DEFAULT(ps->config.queue_size, PULSE_SENSOR_QUEUE_SIZE)
     SET_DEFAULT(ps->config.notification_timeout, PULSE_SENSOR_NOTIFICATION_TIMEOUT)
 
@@ -299,6 +311,15 @@ esp_err_t pulse_sensor_close(pulse_sensor_h ps)
     return ESP_OK;
 }
 
+pulse_sensor_rate_t pulse_sensor_get_current_rate(const pulse_sensor_h ps)
+{
+    pulse_sensor_rate_t rate = {};
+    VALIDATE_PULSE_SENSOR(ps, "get_current_rate", rate)
+    rate.pulses = ps->previous_tick_pulses + ps->latest_tick_pulses;
+    rate.duration = esp_timer_get_time() - ps->previous_tick_timestamp;
+    return rate;
+}
+
 bool pulse_sensor_is_in_cycle(const pulse_sensor_h ps)
 {
     VALIDATE_PULSE_SENSOR(ps, "is_in_cycle", false)
@@ -329,6 +350,15 @@ uint64_t pulse_sensor_get_current_cycle_duration(const pulse_sensor_h ps)
     return ps->current_cycle_timestamp ? esp_timer_get_time() - ps->current_cycle_timestamp : 0;
 }
 
+pulse_sensor_rate_t pulse_sensor_get_current_cycle_rate(const pulse_sensor_h ps)
+{
+    pulse_sensor_rate_t rate = {};
+    VALIDATE_PULSE_SENSOR(ps, "get_current_cycle_rate", rate)
+    rate.pulses = pulse_sensor_get_current_cycle_pulses(ps);
+    rate.duration = pulse_sensor_get_current_cycle_duration(ps);
+    return rate;
+}
+
 uint64_t pulse_sensor_get_total_pulses(const pulse_sensor_h ps)
 {
     VALIDATE_PULSE_SENSOR(ps, "get_total_pulses", 0)
@@ -345,4 +375,13 @@ uint32_t pulse_sensor_get_total_cycles(const pulse_sensor_h ps)
 {
     VALIDATE_PULSE_SENSOR(ps, "get_total_cycles", 0)
     return ps->total_cycles;
+}
+
+pulse_sensor_rate_t pulse_sensor_get_total_rate(const pulse_sensor_h ps)
+{
+    pulse_sensor_rate_t rate = {};
+    VALIDATE_PULSE_SENSOR(ps, "get_total_rate", rate)
+    rate.pulses = pulse_sensor_get_total_pulses(ps);
+    rate.duration = pulse_sensor_get_total_duration(ps);
+    return rate;
 }
