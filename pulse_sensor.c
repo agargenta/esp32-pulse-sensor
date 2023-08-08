@@ -26,18 +26,18 @@
  * @file pulse_sensor.c
  */
 
-#include "pulse_sensor.h"
+#include <stdio.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-
-#include <stdio.h>
+#include "pulse_sensor.h"
 
 #define SET_DEFAULT(v, d) \
     if (!v)               \

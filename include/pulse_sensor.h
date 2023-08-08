@@ -32,12 +32,12 @@
 
 #pragma once
 
-#include "driver/gpio.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include <esp_err.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <esp_err.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
 
 #define PULSE_SENSOR_MIN_CYCLE_PULSES 1
 #define PULSE_SENSOR_CYCLE_TIMEOUT 1000000 // 1 second (in microseconds)
