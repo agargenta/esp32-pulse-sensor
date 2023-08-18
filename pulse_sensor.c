@@ -340,7 +340,7 @@ float pulse_sensor_get_current_rate(const pulse_sensor_data_t *data)
 uint64_t pulse_sensor_get_current_cycle_duration(const pulse_sensor_data_t *data)
 {
     ESP_RETURN_ON_FALSE(data, 0, TAG, "NULL data");
-    return data->current_rate_timestamp == 0 ? 0 : data->data_timestamp - data->current_rate_timestamp;
+    return data->current_cycle_timestamp == 0 ? 0 : data->data_timestamp - data->current_cycle_timestamp;
 }
 
 float pulse_sensor_get_current_cycle_rate(const pulse_sensor_data_t *data)
