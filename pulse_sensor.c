@@ -27,23 +27,16 @@
  */
 
 #include <stdio.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-
-#include "esp_check.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "driver/gpio.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <esp_check.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <driver/gpio.h>
 
 #include "pulse_sensor.h"
-
-#define SET_DEFAULT(v, d) \
-    if (!v)               \
-    {                     \
-        v = d;            \
-    }
 
 #define VALIDATE_PULSE_SENSOR(pulse_sensor, op_name, return_value)                \
     if (!pulse_sensor)                                                            \
@@ -51,197 +44,217 @@
         ESP_LOGW(TAG, "ignoring attempt to call pulse_sensor_%s(NULL)", op_name); \
         return return_value;                                                      \
     }
-
+#define MUTEX_TIMEOUT pdMS_TO_TICKS(3) // max time to wait for a lock (3 ms)
 struct pulse_sensor_s
 {
-    pulse_sensor_config_t config;               /// the config used to open this device
-    QueueHandle_t queue;                        /// internal queue for managing pulses and ticks
-    TaskHandle_t task;                          /// internal task for processing pulses and ticks
-    esp_timer_handle_t timer;                   /// internal timer for generating ticks
-    int64_t latest_pulse_timestamp;             /// the time (usec since boot) of the latest (most recent) pulse (includes jitter)
-    int64_t latest_significant_pulse_timestamp; /// the time (usec since boot) of the latest (most recent) significant pulse (ignores jitter)
-    int64_t latest_tick_timestamp;              /// the time (usec since boot) of the latest tick
-    int64_t previous_tick_timestamp;            /// the time (usec since boot) of the tick preceding the latest one
-    uint32_t latest_tick_pulses;                /// the number of pulses since latest_tick_timestamp (could include jitter)
-    uint32_t previous_tick_pulses;              /// the number of pulses from previous_tick_pulses until latest_tick_timestamp (could include jitter)
-    int64_t current_cycle_timestamp;            /// the time (usec since boot) of the first pulse in the current cycle
-    uint64_t current_cycle_pulses;              /// the number of pulses in the current cycle
-    uint64_t total_pulses;                      /// the total pulses across all cycles (includes jitter)
-    uint64_t total_significant_pulses;          /// the total significant pulses across all cycles (ignores jitter)
-    uint64_t total_duration;                    /// the total duration (usec) across all cycles
-    uint32_t total_cycles;                      /// the total number of cycles
+    pulse_sensor_config_t config; /// the config used to open this device
+    QueueHandle_t queue;          /// internal queue for managing pulses and ticks
+    TaskHandle_t task;            /// internal task for processing pulses and ticks
+    esp_timer_handle_t timer;     /// internal timer for generating ticks
+    SemaphoreHandle_t mutex;      /// synchronization mutex
+    pulse_sensor_data_t data;     /// measurement data
+
+    int64_t tentative_pulse_timestamp; /// tentative pulse timestamp (µs since boot)
+    int64_t tentative_cycle_timestamp; /// tentative cycle timestamp (µs since boot)
+    uint32_t tentative_cycle_pulses;   /// tentative cycle pulses
+
+    int64_t latest_tick_timestamp; /// the time (µs since boot) of the latest tick
+    uint32_t latest_tick_pulses;   /// the number of pulses since latest_tick_timestamp
 };
 
 typedef enum
 {
-    PULSE_SENSOR_PULSE = 1, /// a pulse coming from the device
+    PULSE_SENSOR_PULSE = 1, /// a pulse coming from the sensor
     PULSE_SENSOR_TICK = 2   /// a tick coming from the internal timer
 } pulse_sensor_event_type_t;
 
 typedef struct
 {
     pulse_sensor_event_type_t type; /// the type of the event
-    int64_t timestamp;              /// time (usec since boot) of when this event occurred
+    int64_t timestamp;              /// time (µs since boot) of when this event occurred
 } pulse_sensor_event_t;
 
 static const char *TAG = "pulse_sensor";
 
 static void IRAM_ATTR gpio_interrupt_handler(void *args)
 {
-    const pulse_sensor_h ps = (pulse_sensor_h)args;
+    const pulse_sensor_t sensor = (pulse_sensor_t)args;
     const pulse_sensor_event_t m = {.type = PULSE_SENSOR_PULSE, .timestamp = esp_timer_get_time()};
-    xQueueSendToBackFromISR(ps->queue, (void *)&(m), NULL);
+    xQueueSendToBackFromISR(sensor->queue, (void *)&(m), NULL);
 }
 
 static void timer_handler(void *args)
 {
-    const pulse_sensor_h ps = (pulse_sensor_h)args;
+    const pulse_sensor_t sensor = (pulse_sensor_t)args;
     const pulse_sensor_event_t m = {.type = PULSE_SENSOR_TICK, .timestamp = esp_timer_get_time()};
-    const BaseType_t r = xQueueSendToBack(ps->queue, (void *)&(m), pdMS_TO_TICKS(10));
+    const BaseType_t r = xQueueSendToBack(sensor->queue, (void *)&(m), pdMS_TO_TICKS(10));
     if (r != pdTRUE)
     {
-        ESP_LOGW(TAG, "Timer tick event timeout on GPIO %d queue: %d", ps->config.gpio_num, r);
+        ESP_LOGW(TAG, "Timer tick event timeout on GPIO %d queue: %d", sensor->config.gpio_num, r);
     }
 }
 
-static void pulse_sensor_notify(const pulse_sensor_h ps, const pulse_sensor_notification_type_t type)
+static esp_err_t pulse_sensor_notify(const pulse_sensor_t sensor,
+                                     const pulse_sensor_notification_type_t type,
+                                     int64_t timestamp)
 {
-    ESP_LOGD(TAG, "Notification: gpio=%d, type=%d, pulses=%llu, duration=%lld (usec)",
-             ps->config.gpio_num,
-             type,
-             ps->current_cycle_pulses,
-             ps->latest_pulse_timestamp - ps->current_cycle_timestamp);
-    if (ps->config.notification_queue)
+    if (sensor->config.notification_queue)
     {
+        ESP_LOGD(TAG, "Sending notification %d for GPIO %d", type, sensor->config.gpio_num);
         const pulse_sensor_notification_t n = {
+            .sensor = sensor,
+            .notification_arg = sensor->config.notification_arg,
             .type = type,
-            .notification_arg = ps->config.notification_arg,
-            .timestamp = ps->latest_pulse_timestamp,
-            .pulses = ps->current_cycle_pulses,
-            .duration = ps->latest_pulse_timestamp - ps->current_cycle_timestamp};
-        const BaseType_t r = xQueueSendToBack(ps->config.notification_queue,
-                                              (void *)&(n),
-                                              ps->config.notification_timeout);
-        if (r != pdTRUE)
-        {
-            ESP_LOGW(TAG, "Notification timeout on GPIO %d queue: %d", ps->config.gpio_num, r);
-        }
+            .timestamp = timestamp};
+        ESP_RETURN_ON_FALSE(
+            xQueueSend(sensor->config.notification_queue, (void *)&(n), sensor->config.notification_timeout),
+            ESP_ERR_TIMEOUT, TAG, "sending notification %d on GPIO %d", type, sensor->config.gpio_num);
     }
+    return ESP_OK;
 }
 
 static void pulse_sensor_task(void *args)
 {
-    const pulse_sensor_h ps = (pulse_sensor_h)args;
+    const pulse_sensor_t sensor = (pulse_sensor_t)args;
     pulse_sensor_event_t m;
-    ESP_LOGD(TAG, "Monitoring on GPIO %d", ps->config.gpio_num);
+    ESP_LOGD(TAG, "Monitoring on GPIO %d", sensor->config.gpio_num);
     while (true)
     {
-        if (!xQueueReceive(ps->queue, &m, portMAX_DELAY))
+        if (!xQueueReceive(sensor->queue, &m, portMAX_DELAY))
         {
-            ESP_LOGW(TAG, "Message timeout on GPIO %d queue. Bailing out.", ps->config.gpio_num);
+            ESP_LOGW(TAG, "Message timeout on GPIO %d queue. Bailing out.", sensor->config.gpio_num);
             break;
         }
+        if (!xSemaphoreTake(sensor->mutex, MUTEX_TIMEOUT))
+        {
+            ESP_LOGW(TAG, "Failed to acquire mutex within %lu ticks on message %d on GPIO %d. Ignoring.",
+                     MUTEX_TIMEOUT, m.type, sensor->config.gpio_num);
+            continue;
+        }
+
         switch (m.type)
         {
         case PULSE_SENSOR_PULSE:
-            ESP_LOGV(TAG, "Pulse on %d", ps->config.gpio_num);
-            if (ps->current_cycle_pulses == 0)
+            ESP_LOGV(TAG, "Pulse on GPIO %d", sensor->config.gpio_num);
+            if (sensor->data.current_cycle_pulses == 0) // in tentative cycle
             {
-                ESP_ERROR_CHECK_WITHOUT_ABORT(
-                    esp_timer_start_periodic(ps->timer, ps->config.check_period));
-                ESP_LOGD(TAG, "Started timer on GPIO %d", ps->config.gpio_num);
-            }
-            ps->latest_tick_pulses++;
-            ps->current_cycle_pulses++;
-            ps->total_pulses++;
+                sensor->tentative_pulse_timestamp = m.timestamp;
+                if (sensor->tentative_cycle_timestamp == 0)
+                {
+                    sensor->tentative_cycle_timestamp = m.timestamp;
+                }
+                if (sensor->tentative_cycle_pulses == 0) // first tentative pulse
+                {
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(
+                        esp_timer_start_periodic(sensor->timer, sensor->config.check_period));
+                    ESP_LOGD(TAG, "Started timer on GPIO %d", sensor->config.gpio_num);
+                }
+                sensor->tentative_cycle_pulses++;
+                if (sensor->tentative_cycle_pulses == sensor->config.min_cycle_pulses)
+                {
+                    // graduate from a tentative to a real cycle and update aggregate stats
+                    sensor->data.latest_pulse_timestamp = m.timestamp;
+                    sensor->data.current_cycle_timestamp = sensor->tentative_cycle_timestamp;
+                    sensor->data.current_cycle_pulses = sensor->tentative_cycle_pulses;
+                    sensor->data.total_pulses += sensor->tentative_cycle_pulses;
+                    sensor->data.total_duration += m.timestamp - sensor->tentative_cycle_timestamp;
+                    sensor->data.cycles++;
 
-            ps->latest_pulse_timestamp = m.timestamp;
-            if (ps->current_cycle_timestamp == 0)
-            {
-                ps->current_cycle_timestamp = m.timestamp;
-            }
+                    // reset tentative stats
+                    sensor->tentative_cycle_pulses = 0;
+                    sensor->tentative_cycle_timestamp = 0;
+                    sensor->tentative_pulse_timestamp = 0;
 
-            if (ps->current_cycle_pulses == ps->config.min_cycle_pulses)
-            {
-                ps->total_significant_pulses += ps->current_cycle_pulses;
-                ps->total_duration += m.timestamp - ps->current_cycle_timestamp;
-                ps->total_cycles++;
-                ps->latest_significant_pulse_timestamp = m.timestamp;
-                ESP_LOGI(TAG, "Cycle %lu started on GPIO %d", ps->total_cycles, ps->config.gpio_num);
-                pulse_sensor_notify(ps, PULSE_SENSOR_CYCLE_STARTED);
+                    ESP_LOGI(TAG, "Cycle %lu started on GPIO %d", sensor->data.cycles, sensor->config.gpio_num);
+                    pulse_sensor_notify(sensor, PULSE_SENSOR_CYCLE_STARTED, m.timestamp);
+                }
             }
-            else if (ps->current_cycle_pulses > ps->config.min_cycle_pulses)
+            else // in current cycle
             {
-                ps->total_significant_pulses++;
-                ps->total_duration += m.timestamp - ps->latest_significant_pulse_timestamp;
-                ps->latest_significant_pulse_timestamp = m.timestamp;
+                sensor->data.current_cycle_pulses++;
+                sensor->data.total_pulses++;
+                sensor->data.total_duration += m.timestamp - sensor->data.latest_pulse_timestamp;
+                sensor->data.latest_pulse_timestamp = m.timestamp;
             }
+            sensor->latest_tick_pulses++;
+            sensor->data.current_rate_pulses++;
             break;
         case PULSE_SENSOR_TICK:
-            ESP_LOGV(TAG, "Tick on %d", ps->config.gpio_num);
-
-            ps->previous_tick_timestamp = ps->latest_tick_timestamp;
-            ps->previous_tick_pulses = ps->latest_tick_pulses;
-            ps->latest_tick_timestamp = m.timestamp;
-            ps->latest_tick_pulses = 0;
-
-            if (ps->current_cycle_pulses > 0 &&
-                (m.timestamp - ps->latest_pulse_timestamp) > ps->config.cycle_timeout)
+            ESP_LOGV(TAG, "Tick on GPIO %d", sensor->config.gpio_num);
+            if (sensor->tentative_cycle_pulses > 0) // in tentative cycle
             {
-                if (ps->current_cycle_pulses >= ps->config.min_cycle_pulses)
+                if (m.timestamp - sensor->tentative_pulse_timestamp > sensor->config.cycle_timeout)
                 {
-                    ESP_LOGI(TAG, "Cycle %lu stopped on GPIO %d", ps->total_cycles, ps->config.gpio_num);
-                    pulse_sensor_notify(ps, PULSE_SENSOR_CYCLE_STOPPED);
+                    ESP_LOGI(TAG, "Ignoring a partial cycle on GPIO %d after %lu pulses",
+                             sensor->config.gpio_num, sensor->tentative_cycle_pulses);
+                    sensor->data.partial_cycles++;
+                    sensor->tentative_cycle_pulses = 0;
+                    sensor->tentative_cycle_timestamp = 0;
+                    sensor->tentative_pulse_timestamp = 0;
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(sensor->timer));
+                    pulse_sensor_notify(sensor, PULSE_SENSOR_CYCLE_IGNORED, m.timestamp);
                 }
-                ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(ps->timer));
-                ESP_LOGD(TAG, "Stopped timer on GPIO %d", ps->config.gpio_num);
-                ps->current_cycle_timestamp = 0;
-                ps->current_cycle_pulses = 0;
-                ESP_LOGD(TAG, "Totals on GPIO %d: pulses=%llu, duration=%lld (usec), cycles=%lu",
-                         ps->config.gpio_num,
-                         ps->total_pulses,
-                         ps->total_duration,
-                         ps->total_cycles);
             }
+            else if (sensor->data.current_cycle_pulses > 0) // in current cycle
+            {
+                if (m.timestamp - sensor->data.latest_pulse_timestamp > sensor->config.cycle_timeout)
+                {
+                    ESP_LOGI(TAG, "Cycle %lu stopped on GPIO %d after %llu pulses and %llu µs",
+                             sensor->data.cycles, sensor->config.gpio_num,
+                             sensor->data.current_cycle_pulses, m.timestamp - sensor->data.current_cycle_timestamp);
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(sensor->timer));
+                    pulse_sensor_notify(sensor, PULSE_SENSOR_CYCLE_STOPPED, m.timestamp);
+                    sensor->data.current_cycle_timestamp = 0;
+                    sensor->data.current_cycle_pulses = 0;
+                }
+            }
+            sensor->data.current_rate_timestamp = sensor->latest_tick_timestamp;
+            sensor->data.current_rate_pulses = sensor->latest_tick_pulses;
+            sensor->latest_tick_timestamp = m.timestamp;
+            sensor->latest_tick_pulses = 0;
             break;
         default:
             ESP_LOGW(TAG, "Unexpected message type on GPIO %d queue: %d. Ignoring.",
-                     ps->config.gpio_num, m.type);
+                     sensor->config.gpio_num, m.type);
+        }
+        sensor->data.data_timestamp = m.timestamp;
+        if (!xSemaphoreGive(sensor->mutex))
+        {
+            ESP_LOGW(TAG, "Failed to release mutex on message %d on GPIO %d.", m.type, sensor->config.gpio_num);
         }
     }
 }
 
-esp_err_t pulse_sensor_open(pulse_sensor_config_t config, pulse_sensor_h *pulse_sensor_p)
+esp_err_t pulse_sensor_open(const pulse_sensor_config_t *config, pulse_sensor_t *sensor_out)
 {
     esp_err_t ret = ESP_FAIL;
-    ESP_GOTO_ON_FALSE(pulse_sensor_p != NULL, ESP_ERR_INVALID_ARG, error_handler, TAG, "null");
+    ESP_GOTO_ON_FALSE(sensor_out, ESP_ERR_INVALID_ARG, error_handler, TAG, "null");
 
-    const pulse_sensor_h ps = calloc(1, sizeof(struct pulse_sensor_s));
-    ESP_GOTO_ON_FALSE(ps != NULL, ESP_ERR_NO_MEM, error_handler, TAG, "malloc pulse sensor");
+    const pulse_sensor_t sensor = calloc(1, sizeof(struct pulse_sensor_s));
+    ESP_GOTO_ON_FALSE(sensor != NULL, ESP_ERR_NO_MEM, error_handler, TAG, "malloc pulse sensor");
 
-    ps->config = config;
-    const gpio_num_t gpio_num = ps->config.gpio_num;
-    SET_DEFAULT(ps->config.min_cycle_pulses, PULSE_SENSOR_MIN_CYCLE_PULSES)
-    SET_DEFAULT(ps->config.cycle_timeout, PULSE_SENSOR_CYCLE_TIMEOUT)
-    SET_DEFAULT(ps->config.check_period, PULSE_SENSOR_CHECK_PERIOD)
-    SET_DEFAULT(ps->config.queue_size, PULSE_SENSOR_QUEUE_SIZE)
-    SET_DEFAULT(ps->config.notification_timeout, PULSE_SENSOR_NOTIFICATION_TIMEOUT)
+    sensor->config = *config;
+    const gpio_num_t gpio_num = sensor->config.gpio_num;
 
-    ps->queue = xQueueCreate(ps->config.queue_size, sizeof(pulse_sensor_event_t));
-    ESP_GOTO_ON_FALSE(ps->queue != NULL, ESP_ERR_NO_MEM, pulse_sensor_cleanup, TAG, "create queue");
+    sensor->mutex = xSemaphoreCreateMutex();
+    ESP_GOTO_ON_FALSE(sensor->mutex, ESP_ERR_NO_MEM, free_sensor, TAG,
+                      "create mutex on GPIO %d", config->gpio_num);
+
+    sensor->queue = xQueueCreate(sensor->config.queue_size, sizeof(pulse_sensor_event_t));
+    ESP_GOTO_ON_FALSE(sensor->queue != NULL, ESP_ERR_NO_MEM, free_mutex, TAG, "create queue");
 
     char name[64];
     snprintf(name, sizeof(name), "pulse sensor task on GPIO %d", gpio_num);
     const BaseType_t r = xTaskCreate(pulse_sensor_task, name, 2048,
-                                     (void *)ps, 1, &(ps->task));
+                                     (void *)sensor, 1, &(sensor->task));
     ESP_GOTO_ON_FALSE(r == pdPASS, ESP_ERR_NO_MEM, queue_cleanup, TAG, "create task: %d", r);
 
     snprintf(name, sizeof(name), "pulse sensor timer on GPIO %d", gpio_num);
     const esp_timer_create_args_t timer_args = {
         .callback = &timer_handler,
-        .arg = (void *)ps,
+        .arg = (void *)sensor,
         .name = name};
-    ESP_GOTO_ON_ERROR(esp_timer_create(&timer_args, &(ps->timer)), task_cleanup, TAG, "create timer");
+    ESP_GOTO_ON_ERROR(esp_timer_create(&timer_args, &(sensor->timer)), task_cleanup, TAG, "create timer");
 
     const gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << gpio_num),
@@ -251,137 +264,104 @@ esp_err_t pulse_sensor_open(pulse_sensor_config_t config, pulse_sensor_h *pulse_
         .intr_type = GPIO_INTR_POSEDGE};
     ESP_GOTO_ON_ERROR(gpio_config(&io_conf), timer_cleanup, TAG, "config GPIO %d", gpio_num);
 
-    ESP_GOTO_ON_ERROR(gpio_isr_handler_add(gpio_num, gpio_interrupt_handler, (void *)ps),
+    ESP_GOTO_ON_ERROR(gpio_isr_handler_add(gpio_num, gpio_interrupt_handler, (void *)sensor),
                       gpio_config_cleanup, TAG, "add ISR handler on GPIO %d", gpio_num);
 
-    *pulse_sensor_p = ps;
+    *sensor_out = sensor;
     ESP_LOGI(TAG,
              "Opened on GPIO %d: min cycle pulses=%lu, cycle timeout=%llu, queue size=%lu",
-             ps->config.gpio_num,
-             ps->config.min_cycle_pulses,
-             ps->config.cycle_timeout,
-             ps->config.queue_size);
+             sensor->config.gpio_num,
+             sensor->config.min_cycle_pulses,
+             sensor->config.cycle_timeout,
+             sensor->config.queue_size);
     return ESP_OK;
 
 gpio_config_cleanup:
     gpio_config_t io_conf_reset = {0};
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&io_conf_reset));
 timer_cleanup:
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_delete(ps->timer));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_delete(sensor->timer));
 task_cleanup:
-    vTaskDelete(ps->task);
+    vTaskDelete(sensor->task);
 queue_cleanup:
-    vQueueDelete(ps->queue);
-pulse_sensor_cleanup:
-    free(ps);
+    vQueueDelete(sensor->queue);
+free_mutex:
+    vSemaphoreDelete(sensor->mutex);
+free_sensor:
+    free(sensor);
 error_handler:
-    ESP_LOGE(TAG, "Failed to open on GPIO %d: ret=0x%x", config.gpio_num, ret);
+    ESP_LOGE(TAG, "Failed to open on GPIO %d: ret=0x%x", config->gpio_num, ret);
     return ret;
 }
 
-esp_err_t pulse_sensor_close(pulse_sensor_h ps)
+esp_err_t pulse_sensor_close(const pulse_sensor_t sensor)
 {
-    VALIDATE_PULSE_SENSOR(ps, "close", ESP_ERR_INVALID_ARG)
-    const gpio_num_t gpio_num = ps->config.gpio_num;
+    ESP_RETURN_ON_FALSE(sensor, ESP_ERR_INVALID_ARG, TAG, "sensor must not be NULL");
+    const gpio_num_t gpio_num = sensor->config.gpio_num;
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_isr_handler_remove(gpio_num));
     gpio_config_t io_conf = {.pin_bit_mask = 1ULL << gpio_num};
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&io_conf));
 
-    if (ps->timer)
+    if (sensor->timer)
     {
-        if (ps->current_cycle_pulses > 0)
+        if (sensor->tentative_cycle_pulses > 0 || sensor->data.current_cycle_pulses > 0)
         {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(ps->timer));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(sensor->timer));
         }
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_delete(ps->timer));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_delete(sensor->timer));
     }
-
-    if (ps->task)
-    {
-        vTaskDelete(ps->task);
-    }
-
-    if (ps->queue)
-    {
-        vQueueDelete(ps->queue);
-    }
-    free(ps);
-
+    vTaskDelete(sensor->task);
+    vQueueDelete(sensor->queue);
+    vSemaphoreDelete(sensor->mutex);
+    free(sensor);
     ESP_LOGI(TAG, "Closed on GPIO %d", gpio_num);
     return ESP_OK;
 }
 
-pulse_sensor_rate_t pulse_sensor_get_current_rate(const pulse_sensor_h ps)
+esp_err_t pulse_sensor_get_data(const pulse_sensor_t sensor, pulse_sensor_data_t *data)
 {
-    pulse_sensor_rate_t rate = {};
-    VALIDATE_PULSE_SENSOR(ps, "get_current_rate", rate)
-    rate.pulses = ps->previous_tick_pulses + ps->latest_tick_pulses;
-    rate.duration = esp_timer_get_time() - ps->previous_tick_timestamp;
-    return rate;
+    ESP_RETURN_ON_FALSE(sensor, ESP_ERR_INVALID_ARG, TAG, "sensor must not be NULL");
+    ESP_RETURN_ON_FALSE(data, ESP_ERR_INVALID_ARG, TAG, "data must not be NULL");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(sensor->mutex, MUTEX_TIMEOUT), ESP_ERR_TIMEOUT, TAG, "acquire mutex");
+    *data = sensor->data;
+    ESP_RETURN_ON_FALSE(xSemaphoreGive(sensor->mutex), ESP_ERR_NOT_FINISHED, TAG, "release mutex");
+    return ESP_OK;
 }
 
-bool pulse_sensor_is_in_cycle(const pulse_sensor_h ps)
+float pulse_sensor_get_current_rate(const pulse_sensor_data_t *data)
 {
-    VALIDATE_PULSE_SENSOR(ps, "is_in_cycle", false)
-    return ps->current_cycle_pulses >= ps->config.min_cycle_pulses;
+    ESP_RETURN_ON_FALSE(data, 0, TAG, "NULL data");
+    return data->current_rate_timestamp == 0
+               ? 0
+               : data->current_rate_pulses /
+                     ((float)(data->data_timestamp - data->current_rate_timestamp) / 1000000);
 }
 
-int64_t pulse_sensor_get_latest_pulse_timestamp(const pulse_sensor_h ps)
+uint64_t pulse_sensor_get_current_cycle_duration(const pulse_sensor_data_t *data)
 {
-    VALIDATE_PULSE_SENSOR(ps, "get_latest_pulse_timestamp", -1)
-    return ps->latest_significant_pulse_timestamp;
+    ESP_RETURN_ON_FALSE(data, 0, TAG, "NULL data");
+    return data->current_rate_timestamp == 0 ? 0 : data->data_timestamp - data->current_rate_timestamp;
 }
 
-int64_t pulse_sensor_get_current_cycle_timestamp(const pulse_sensor_h ps)
+float pulse_sensor_get_current_cycle_rate(const pulse_sensor_data_t *data)
 {
-    VALIDATE_PULSE_SENSOR(ps, "get_current_cycle_timestamp", -1)
-    return ps->current_cycle_timestamp;
+    ESP_RETURN_ON_FALSE(data, 0, TAG, "NULL data");
+    return data->current_cycle_timestamp == 0
+               ? 0
+               : data->current_cycle_pulses /
+                     ((float)pulse_sensor_get_current_cycle_duration(data) / 1000000);
 }
 
-uint64_t pulse_sensor_get_current_cycle_pulses(const pulse_sensor_h ps)
+float pulse_sensor_get_total_rate(const pulse_sensor_data_t *data)
 {
-    VALIDATE_PULSE_SENSOR(ps, "get_current_cycle_pulses", 0)
-    return ps->current_cycle_pulses;
+    ESP_RETURN_ON_FALSE(data, 0, TAG, "NULL data");
+    return data->total_duration == 0
+               ? 0
+               : data->total_pulses / ((float)data->total_duration / 1000000);
 }
 
-uint64_t pulse_sensor_get_current_cycle_duration(const pulse_sensor_h ps)
+bool pulse_sensor_is_in_cycle(const pulse_sensor_data_t *data)
 {
-    VALIDATE_PULSE_SENSOR(ps, "get_current_cycle_duration", 0)
-    return ps->current_cycle_timestamp ? esp_timer_get_time() - ps->current_cycle_timestamp : 0;
-}
-
-pulse_sensor_rate_t pulse_sensor_get_current_cycle_rate(const pulse_sensor_h ps)
-{
-    pulse_sensor_rate_t rate = {};
-    VALIDATE_PULSE_SENSOR(ps, "get_current_cycle_rate", rate)
-    rate.pulses = pulse_sensor_get_current_cycle_pulses(ps);
-    rate.duration = pulse_sensor_get_current_cycle_duration(ps);
-    return rate;
-}
-
-uint64_t pulse_sensor_get_total_pulses(const pulse_sensor_h ps)
-{
-    VALIDATE_PULSE_SENSOR(ps, "get_total_pulses", 0)
-    return ps->total_pulses;
-}
-
-uint64_t pulse_sensor_get_total_duration(const pulse_sensor_h ps)
-{
-    VALIDATE_PULSE_SENSOR(ps, "get_total_duration", 0)
-    return ps->total_duration;
-}
-
-uint32_t pulse_sensor_get_total_cycles(const pulse_sensor_h ps)
-{
-    VALIDATE_PULSE_SENSOR(ps, "get_total_cycles", 0)
-    return ps->total_cycles;
-}
-
-pulse_sensor_rate_t pulse_sensor_get_total_rate(const pulse_sensor_h ps)
-{
-    pulse_sensor_rate_t rate = {};
-    VALIDATE_PULSE_SENSOR(ps, "get_total_rate", rate)
-    rate.pulses = pulse_sensor_get_total_pulses(ps);
-    rate.duration = pulse_sensor_get_total_duration(ps);
-    return rate;
+    ESP_RETURN_ON_FALSE(data, false, TAG, "NULL data");
+    return data->current_cycle_pulses > 0;
 }

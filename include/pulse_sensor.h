@@ -34,30 +34,28 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <esp_err.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "driver/gpio.h"
-
-#define PULSE_SENSOR_MIN_CYCLE_PULSES 1
-#define PULSE_SENSOR_CYCLE_TIMEOUT 1000000 // 1 second (in microseconds)
-#define PULSE_SENSOR_CHECK_PERIOD 1000000  // 1 second (in microseconds)
-
-#define PULSE_SENSOR_QUEUE_SIZE 64
-#define PULSE_SENSOR_NOTIFICATION_TIMEOUT pdMS_TO_TICKS(1) // 1 millisecond (in ticks)
+#include <driver/gpio.h>
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
+    /**
+     * @brief A pointer to an opaque structure representing an opened pulse sensor.
+     */
+    typedef struct pulse_sensor_s *pulse_sensor_t;
 
     /**
      * @brief Notification types.
      */
     typedef enum
     {
-        PULSE_SENSOR_CYCLE_STARTED = 1,
-        PULSE_SENSOR_CYCLE_STOPPED = 2
+        PULSE_SENSOR_CYCLE_STARTED,
+        PULSE_SENSOR_CYCLE_STOPPED,
+        PULSE_SENSOR_CYCLE_IGNORED,
     } pulse_sensor_notification_type_t;
 
     /**
@@ -65,11 +63,10 @@ extern "C"
      */
     typedef struct
     {
-        pulse_sensor_notification_type_t type; /// type of the notification
+        pulse_sensor_t sensor;                 /// the sensor that generated this event
         void *notification_arg;                /// configured argument
+        pulse_sensor_notification_type_t type; /// type of the notification
         int64_t timestamp;                     /// time (in microseconds since boot) when this event occurred
-        uint64_t pulses;                       /// the number of pulses associated with this event
-        uint64_t duration;                     /// the duration (in microseconds) associated with this event
     } pulse_sensor_notification_t;
 
     /**
@@ -87,123 +84,85 @@ extern "C"
         void *notification_arg;           /// an argument to pass in each notification message (optional)
     } pulse_sensor_config_t;
 
-    /**
-     * @brief Rate definition.
-     */
+#define PULSE_SENSOR_CONFIG_DEFAULT()             \
+    {                                             \
+        .min_cycle_pulses = 1,                    \
+        .cycle_timeout = 1000000,                 \
+        .check_period = 1000000,                  \
+        .queue_size = 64,                         \
+        .notification_timeout = pdMS_TO_TICKS(1), \
+    }
+
     typedef struct
     {
-        uint64_t pulses;   /// the number of pulses during the measurement period
-        uint64_t duration; /// the length (in microseconds) of the measurement period
-    } pulse_sensor_rate_t;
-
-    /**
-     * @brief A pointer to an opaque structure representing an opened pulse sensor.
-     */
-    typedef struct pulse_sensor_s *pulse_sensor_h;
+        int64_t data_timestamp;          /// the time (µs since boot) when this data was last updated
+        int64_t latest_pulse_timestamp;  /// the time (µs since boot) of the latest pulse
+        int64_t current_rate_timestamp;  /// the time (µs since boot) of the current rate measurement period (~ 1-2 cycle_timeout ago)
+        uint32_t current_rate_pulses;    /// the number of pulses since current_rate_timestamp
+        int64_t current_cycle_timestamp; /// the time (usec since boot) of the start of the current cycle
+        uint64_t current_cycle_pulses;   /// the number of pulses since current_cycle_timestamp
+        uint64_t total_pulses;           /// the number of pulses since this sensor was opened
+        uint64_t total_duration;         /// total time (µs) during which there were continuous pulses, since thi sensor was opened
+        uint32_t cycles;                 /// the number of cycles since this sensor was opened
+        uint32_t partial_cycles;         /// the number of would-be cycles since this sensor was opened (these are the cycles that timed out before being counted)
+    } pulse_sensor_data_t;
 
     /**
      * @brief Open a device instance with the specified config.
-     * @param[in] config The device config instance.
-     * @param[out] pulse_sensor_p Pointer to initialised pulse sensor instance.
+     * @param[in] config Pointer to the sensor config instance.
+     * @param[out] sensor_out Pointer to initialised pulse sensor instance.
      * @return ESP_OK if successfully opened; otherwise, an error code.
      */
-    esp_err_t pulse_sensor_open(const pulse_sensor_config_t config, pulse_sensor_h *pulse_sensor_p);
+    esp_err_t pulse_sensor_open(const pulse_sensor_config_t *config, pulse_sensor_t *sensor_out);
 
     /**
      * @brief Close a device instance.
-     * @param[in] pulse_sensor The pulse sensor to close.
+     * @param[in] sensor The pulse sensor to close.
      * @return ESP_OK if successfully closed; otherwise, an error code.
      */
-    esp_err_t pulse_sensor_close(pulse_sensor_h pulse_sensor);
+    esp_err_t pulse_sensor_close(const pulse_sensor_t sensor);
 
     /**
-     * @brief Get the current pluse rate since the previous check period, which could be up to
-     *        2x check_period in duration).
-     * @param[in] pulse_sensor The pulse sensor to check period.
-     * @return the current pluse rate since the previous check period; an empty structure if the
-     *         pulse_sensor is null.
+     * @brief Get the current state of the sensor's data.
+     * @param[in] data The pulse sensor from which to obtain data.
+     * @return ESP_OK if the data was successfully obtained; otherwise, an error code.
      */
-    pulse_sensor_rate_t pulse_sensor_get_current_rate(const pulse_sensor_h pulse_sensor);
+    esp_err_t pulse_sensor_get_data(const pulse_sensor_t sensor, pulse_sensor_data_t *data);
 
     /**
-     * @brief Check if the pulse sensor is currently in an active cycle.
-     * @param[in] pulse_sensor The pulse sensor to check.
+     * @brief A convenience function to get the current pluse rate (pulses per second).
+     * @param[in] data The pulse sensor data obtained via pulse_sensor_get_data.
+     * @return The current pulse rate (pulses per second).
+     */
+    float pulse_sensor_get_current_rate(const pulse_sensor_data_t *data);
+
+    /**
+     * @brief A convenience function to get the current cycle duration.
+     * @param[in] data The pulse sensor data obtained via pulse_sensor_get_data.
+     * @return The current cycle pulse duration (µs).
+     */
+    uint64_t pulse_sensor_get_current_cycle_duration(const pulse_sensor_data_t *data);
+
+    /**
+     * @brief A convenience function to get the current cycle pluse rate (pulses per second).
+     * @param[in] data The pulse sensor data obtained via pulse_sensor_get_data.
+     * @return The current cycle pulse rate (pulses per second).
+     */
+    float pulse_sensor_get_current_cycle_rate(const pulse_sensor_data_t *data);
+
+    /**
+     * @brief A convenience function to get the total pluse rate (pulses per second).
+     * @param[in] data The pulse sensor data obtained via pulse_sensor_get_data.
+     * @return The total (cumulative) pulse rate (pulses per second).
+     */
+    float pulse_sensor_get_total_rate(const pulse_sensor_data_t *data);
+
+    /**
+     * @brief A convenience function to check if the pulse sensor is currently in an active cycle.
+     * @param[in] sensor The pulse sensor to check.
      * @return true if in active cycle; false otherwise (including on any errors).
      */
-    bool pulse_sensor_is_in_cycle(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the timestamp (microseconds since boot) of the latest pulse.
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return microseconds since boot of the latest pulse cycle; -1 if pulse_sensor is null.
-     */
-    int64_t pulse_sensor_get_latest_pulse_timestamp(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the timestamp (microseconds since boot) of when the current cycle started.
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return microseconds since boot when the current cycle started; 0 if not in cycle;
-     *         -1 if pulse_sensor is null.
-     */
-    int64_t pulse_sensor_get_current_cycle_timestamp(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the count of pulses since the current cycle started.
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return the pulse count of the current cycle; 0 if not in cycle; -1 if pulse_sensor is null.
-     */
-    uint64_t pulse_sensor_get_current_cycle_pulses(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the duration (in microseconds) since the current cycle started.
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return the duration (in microseconds) since the current cycle started; 0 if not in cycle;
-     *         -1 if pulse_sensor is null.
-     */
-    uint64_t pulse_sensor_get_current_cycle_duration(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the rate of pulses since the current cycle started. This is a convenience function
-     *        that essentially combines pulse_sensor_get_current_cycle_pulses(const pulse_sensor_h)
-     *        and pulse_sensor_get_current_cycle_duration(const pulse_sensor_h).
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return the rate (pulses and duration in microseconds) since the current cycle started;
-     *         an empty structure if not in cycle or if the pulse_sensor is null.
-     */
-    pulse_sensor_rate_t pulse_sensor_get_current_cycle_rate(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the total count of pulses since this device was opened.
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return the pulse count since this device was opened (possibly 0); -1 if pulse_sensor is null.
-     */
-    uint64_t pulse_sensor_get_total_pulses(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the duration (in microseconds) of all cycles since the device was opened.
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return the duration (in microseconds) of all cycles since the device was opened (possibly 0);
-     *         -1 if pulse_sensor is null.
-     */
-    uint64_t pulse_sensor_get_total_duration(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the total count of cycles since this device was opened.
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return the total count of cycles since this device was opened (possibly 0);
-     *         -1 if pulse_sensor is null.
-     */
-    uint32_t pulse_sensor_get_total_cycles(const pulse_sensor_h pulse_sensor);
-
-    /**
-     * @brief Get the rate of pulses since since this device was opened. This is a convenience
-     *        function that essentially combines pulse_sensor_get_total_pulses(const pulse_sensor_h)
-     *        and pulse_sensor_get_total_duration(const pulse_sensor_h).
-     * @param[in] pulse_sensor The pulse sensor to check.
-     * @return the rate (pulses and duration in microseconds) since this device was opened;
-     *         an empty structure if no pulses or if the pulse_sensor is null.
-     */
-    pulse_sensor_rate_t pulse_sensor_get_total_rate(const pulse_sensor_h pulse_sensor);
+    bool pulse_sensor_is_in_cycle(const pulse_sensor_data_t *data);
 
 #ifdef __cplusplus
 }
