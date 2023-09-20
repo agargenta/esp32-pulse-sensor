@@ -5,7 +5,7 @@
 This is an ESP32-compatible C component for interfacing with pulse sensors (e.g.
 [Hall-effect](https://en.wikipedia.org/wiki/Hall_effect)-based flow-meters) via GPIO (interrupts).
 
-Note, in this context, "pulses" assume quick changes in voltage on a wire response to an external
+Note, in this context, "pulses" assume quick changes in voltage on a wire in response to an external
 signal (e.g. water spinning a magnet around a sensor).
 
 It was tested with v5.2 of the [ESP-IDF](https://github.com/espressif/esp-idf) environment.
